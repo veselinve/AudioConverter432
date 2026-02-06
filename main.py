@@ -13,6 +13,10 @@ from typing import List, Optional, Tuple, \
     Union  # Union might be needed for PopenResult type hints for older Pythons, but | is fine for 3.10+
 import logging
 import json  # Added for parsing ffprobe JSON output
+import zipfile
+import tempfile
+import time
+import urllib.request
 
 # =============================================================================
 # 0.  FFmpeg resolver
@@ -47,6 +51,51 @@ def _setup_logging():
 
     logging.info("Application logging initialized.")
     logging.info(f"Initial FFmpeg path: {_FFMPEG}, FFprobe path: {_FFPROBE}")
+
+
+
+def _download_ffmpeg_windows(dest_bin_dir: Path) -> Tuple[Optional[Path], Optional[Path]]:
+    """Download a known-good FFmpeg build on Windows into dest_bin_dir.
+
+    This keeps the project portable (no global install required).
+    """
+    try:
+        dest_bin_dir.mkdir(parents=True, exist_ok=True)
+        ffmpeg_exe = dest_bin_dir / "ffmpeg.exe"
+        ffprobe_exe = dest_bin_dir / "ffprobe.exe"
+        if ffmpeg_exe.exists() and ffprobe_exe.exists():
+            return ffmpeg_exe, ffprobe_exe
+
+        url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+        logging.warning(f"FFmpeg not found. Attempting auto-download: {url}")
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            zip_path = td_path / "ffmpeg.zip"
+            urllib.request.urlretrieve(url, zip_path)  # nosec - expected download
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(td_path)
+
+            # Find extracted ffmpeg*/bin
+            bin_dir: Optional[Path] = None
+            for p in td_path.iterdir():
+                if p.is_dir() and p.name.lower().startswith("ffmpeg"):
+                    cand = p / "bin"
+                    if (cand / "ffmpeg.exe").is_file() and (cand / "ffprobe.exe").is_file():
+                        bin_dir = cand
+                        break
+            if not bin_dir:
+                logging.error("Auto-download succeeded but could not locate ffmpeg.exe/ffprobe.exe inside the zip.")
+                return None, None
+
+            shutil.copy2(bin_dir / "ffmpeg.exe", ffmpeg_exe)
+            shutil.copy2(bin_dir / "ffprobe.exe", ffprobe_exe)
+
+        logging.warning(f"Auto-downloaded FFmpeg into: {dest_bin_dir}")
+        return ffmpeg_exe, ffprobe_exe
+    except Exception as e:
+        logging.warning(f"Auto-download failed: {e}")
+        return None, None
 
 
 def _resolve_ffmpeg(ffmpeg_arg: Optional[Path | str]) -> None:
@@ -102,47 +151,82 @@ def _resolve_ffmpeg(ffmpeg_arg: Optional[Path | str]) -> None:
         logging.info("Checking bundled layouts for ffmpeg/ffprobe.")
         source_of_resolution = "bundled files"
 
+        # Determine one or more roots to search for bundled/portable FFmpeg.
+        # - Script mode: directory of main.py
+        # - Frozen mode: both the unpacked bundle dir and the EXE directory
         if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-            # When frozen, _MEIPASS is the path to the temporary bundle directory
-            here = Path(sys._MEIPASS)
-            logging.info(f"Application is frozen. Using bundle_dir for bundled search: {here}")
+            bundle_root = Path(sys._MEIPASS)
+            exe_root = Path(sys.executable).resolve().parent
+            search_roots = [bundle_root, exe_root]
+            logging.info(f"Application is frozen. bundle_root={bundle_root}, exe_root={exe_root}")
         else:
-            # Not frozen, determine path based on __file__ or cwd
             try:
-                here = Path(__file__).resolve().parent
+                script_root = Path(__file__).resolve().parent
             except NameError:  # if __file__ is not defined (e.g. interactive session)
-                here = Path.cwd()
-                logging.warning(f"__file__ not defined, using current working directory for bundled search: {here}")
+                script_root = Path.cwd()
+                logging.warning(f"__file__ not defined, using current working directory for bundled search: {script_root}")
+            search_roots = [script_root]
 
-        script_dir_ffmpeg = here / ffmpeg_exe_name
-        script_dir_ffprobe = here / ffprobe_exe_name
-        logging.info(
-            f"Checking next to script/executable: ffmpeg='{script_dir_ffmpeg}', ffprobe='{script_dir_ffprobe}'")
-        if script_dir_ffmpeg.is_file() and script_dir_ffprobe.is_file():
-            resolved_ffmpeg_path = str(script_dir_ffmpeg)
-            resolved_ffprobe_path = str(script_dir_ffprobe)
-            logging.info("Resolved from script/executable directory.")
-        else:
-            logging.info("Checking subdirectories for ffmpeg/ffprobe.")
-            for item in here.iterdir():
-                if item.is_dir() and item.name.lower().startswith("ffmpeg"):
-                    bin_dir_ffmpeg = item / "bin" / ffmpeg_exe_name
-                    bin_dir_ffprobe = item / "bin" / ffprobe_exe_name
-                    root_dir_ffmpeg = item / ffmpeg_exe_name
-                    root_dir_ffprobe = item / ffprobe_exe_name
+        # 1) Prefer project-local portable FFmpeg if present: ./vendors/ffmpeg/bin/{ffmpeg,ffprobe}.exe
+        for root in search_roots:
+            vendors_bin = root / "vendors" / "ffmpeg" / "bin"
+            vend_ffmpeg = vendors_bin / ffmpeg_exe_name
+            vend_ffprobe = vendors_bin / ffprobe_exe_name
+            logging.info(f"Checking vendors FFmpeg under: {vendors_bin}")
+            if vend_ffmpeg.is_file() and vend_ffprobe.is_file():
+                resolved_ffmpeg_path = str(vend_ffmpeg.resolve())
+                resolved_ffprobe_path = str(vend_ffprobe.resolve())
+                logging.info(f"Resolved from vendors/ffmpeg/bin under: {root}")
+                break
 
-                    if bin_dir_ffmpeg.is_file() and bin_dir_ffprobe.is_file():
-                        resolved_ffmpeg_path = str(bin_dir_ffmpeg.resolve())
-                        resolved_ffprobe_path = str(bin_dir_ffprobe.resolve())
-                        logging.info(f"Resolved from subdirectory bin: {item.name}")
+        # 2) If missing on Windows, try auto-download into a writable vendors folder (script dir or EXE dir).
+        if not resolved_ffmpeg_path and os.name == "nt":
+            dest_root = search_roots[-1]  # prefer EXE dir when frozen, else script dir
+            vendors_bin = dest_root / "vendors" / "ffmpeg" / "bin"
+            dl_ffmpeg, dl_ffprobe = _download_ffmpeg_windows(vendors_bin)
+            if dl_ffmpeg and dl_ffprobe and dl_ffmpeg.is_file() and dl_ffprobe.is_file():
+                resolved_ffmpeg_path = str(dl_ffmpeg.resolve())
+                resolved_ffprobe_path = str(dl_ffprobe.resolve())
+                logging.info(f"Resolved after auto-download into: {vendors_bin}")
+
+        # 3) Check next to script/executable root(s): ./ffmpeg(.exe), ./ffprobe(.exe)
+        if not resolved_ffmpeg_path:
+            for root in search_roots:
+                script_dir_ffmpeg = root / ffmpeg_exe_name
+                script_dir_ffprobe = root / ffprobe_exe_name
+                logging.info(f"Checking next to root: ffmpeg='{script_dir_ffmpeg}', ffprobe='{script_dir_ffprobe}'")
+                if script_dir_ffmpeg.is_file() and script_dir_ffprobe.is_file():
+                    resolved_ffmpeg_path = str(script_dir_ffmpeg.resolve())
+                    resolved_ffprobe_path = str(script_dir_ffprobe.resolve())
+                    logging.info(f"Resolved from root directory: {root}")
+                    break
+
+        # 4) Check subdirectories named ffmpeg*: ./ffmpeg-xyz/bin/ffmpeg(.exe)
+        if not resolved_ffmpeg_path:
+            logging.info("Checking 'ffmpeg*' subdirectories for ffmpeg/ffprobe.")
+            for root in search_roots:
+                try:
+                    for item in root.iterdir():
+                        if item.is_dir() and item.name.lower().startswith("ffmpeg"):
+                            bin_dir_ffmpeg = item / "bin" / ffmpeg_exe_name
+                            bin_dir_ffprobe = item / "bin" / ffprobe_exe_name
+                            root_dir_ffmpeg = item / ffmpeg_exe_name
+                            root_dir_ffprobe = item / ffprobe_exe_name
+
+                            if bin_dir_ffmpeg.is_file() and bin_dir_ffprobe.is_file():
+                                resolved_ffmpeg_path = str(bin_dir_ffmpeg.resolve())
+                                resolved_ffprobe_path = str(bin_dir_ffprobe.resolve())
+                                logging.info(f"Resolved from subdirectory bin: {item}")
+                                break
+                            if root_dir_ffmpeg.is_file() and root_dir_ffprobe.is_file():
+                                resolved_ffmpeg_path = str(root_dir_ffmpeg.resolve())
+                                resolved_ffprobe_path = str(root_dir_ffprobe.resolve())
+                                logging.info(f"Resolved from subdirectory root: {item}")
+                                break
+                    if resolved_ffmpeg_path:
                         break
-                    elif root_dir_ffmpeg.is_file() and root_dir_ffprobe.is_file():
-                        resolved_ffmpeg_path = str(root_dir_ffmpeg.resolve())
-                        resolved_ffprobe_path = str(root_dir_ffprobe.resolve())
-                        logging.info(f"Resolved from subdirectory root: {item.name}")
-                        break
-            if not resolved_ffmpeg_path:
-                logging.info("Not found in subdirectories.")
+                except Exception as e:
+                    logging.info(f"Skipping subdir scan under {root}: {e}")
 
     if resolved_ffmpeg_path and resolved_ffprobe_path:
         _FFMPEG = resolved_ffmpeg_path
@@ -250,7 +334,61 @@ def _popen_run(cmd: List[str], capture_output: bool = False, text: bool = False,
     return PopenResult(args=cmd_str, returncode=returncode, stdout=stdout, stderr=stderr)
 
 
-SUPPORTED_EXTS = {".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wma"}
+# Backwards-compatible list of common media extensions.
+# NOTE: We *do not* rely solely on extensions anymore; we also probe files with ffprobe.
+KNOWN_MEDIA_EXTS = {
+    # Common audio
+    ".wav", ".flac", ".mp3", ".m4a", ".aac", ".wma", ".ogg", ".opus",
+    ".aif", ".aiff", ".aifc", ".caf", ".amr", ".au", ".snd",
+    ".mp1", ".mp2", ".mp4", ".m4b", ".m4v", ".3gp", ".3g2",
+    ".ac3", ".dts",
+    ".ape", ".wv", ".tta",
+    # Common video containers that may contain audio-only content or music videos
+    ".mkv", ".webm", ".mov", ".avi", ".ts", ".m2ts",
+    # Ogg family variants
+    ".oga", ".ogv",
+    # Matroska audio
+    ".mka",
+}
+
+# Extensions we can *output* to while keeping the same container/extension.
+# For other inputs, we default output to .mp3 for maximum compatibility.
+OUTPUT_EXTS = {".mp3", ".m4a", ".aac", ".flac", ".wav", ".wma", ".ogg", ".opus"}
+
+# Extensions where video streams are valid/expected in the container.
+VIDEO_CONTAINER_EXTS = {
+    ".mkv", ".mp4", ".m4v", ".mov", ".webm", ".avi", ".ts", ".m2ts", ".mts",
+    ".mpg", ".mpeg", ".mpe", ".m2v", ".vob", ".wmv", ".asf", ".flv", ".f4v",
+    ".3gp", ".3g2", ".ogv",
+}
+
+# A small ignore list so we don't ffprobe obvious non-media files in large folders.
+IGNORE_EXTS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff",
+    ".txt", ".md", ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".csv",
+    ".json", ".xml", ".html", ".htm", ".css", ".js", ".py", ".ini", ".log",
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".iso",
+    ".exe", ".dll",
+    ".bak",
+}
+
+
+
+def _choose_output_ext(input_ext: str, has_real_video: bool) -> str:
+    """Decide output extension.
+
+    - If the source has real video, keep the container extension (so we can copy the video stream).
+    - If the input is a supported audio output type, keep it.
+    - Otherwise default to .mp3 for broad compatibility.
+    """
+    in_ext = (input_ext or "").lower()
+    if has_real_video:
+        return in_ext or ".mp4"
+    if in_ext == ".wma":
+        return ".mp3"
+    if in_ext in OUTPUT_EXTS:
+        return in_ext
+    return ".mp3"
 
 _FFMPEG_IGNORE_LINES = re.compile(
     r"^(ffmpeg version\b|"
@@ -269,13 +407,59 @@ def _clean_ffmpeg_err(raw: bytes) -> str:
     return "\n".join(meaningful_lines[-15:]) if meaningful_lines else "(no ffmpeg stderr captured)"
 
 
+def _unique_backup_path(p: Path) -> Path:
+    """Return a non-existing backup path like 'file.ext.bak', 'file.ext.bak1', ..."""
+    base = p.with_name(p.name + ".bak")
+    if not base.exists():
+        return base
+    for i in range(1, 1000):
+        cand = p.with_name(p.name + f".bak{i}")
+        if not cand.exists():
+            return cand
+    raise RuntimeError(f"Too many backups already exist for: {p}")
+
+
+def _replace_original_with_backup(original: Path, new_file: Path) -> None:
+    """Atomically replace 'original' with 'new_file', keeping a .bak copy of the original."""
+    backup = _unique_backup_path(original)
+    try:
+        os.replace(str(original), str(backup))
+        os.replace(str(new_file), str(original))
+    except Exception:
+        # Best-effort rollback: if original is missing but backup exists, restore it.
+        try:
+            if not original.exists() and backup.exists():
+                os.replace(str(backup), str(original))
+        except Exception:
+            pass
+        raise
+
+
+
 HQ_CODEC: dict[str, List[str]] = {
     ".mp3": ["-c:a", "libmp3lame", "-b:a", "320k", "-compression_level", "0"],
     ".m4a": ["-c:a", "aac", "-b:a", "512k", "-movflags", "+faststart"],
     ".aac": ["-c:a", "aac", "-b:a", "512k"],
     ".flac": ["-c:a", "flac", "-compression_level", "8"],
     ".wav": ["-c:a", "pcm_s24le"],
-    ".wma": ["-c:a", "wmapro", "-b:a", "320k"]
+    ".wma": ["-c:a", "wmapro", "-b:a", "320k"],
+    ".ogg": ["-c:a", "libvorbis", "-q:a", "6"],
+    ".opus": ["-c:a", "libopus", "-b:a", "192k"],
+
+# Video containers (audio will be re-encoded; video/subs copied)
+".mkv": ["-c:a", "flac", "-compression_level", "8"],
+".mp4": ["-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart"],
+".m4v": ["-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart"],
+".mov": ["-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart"],
+".webm": ["-c:a", "libopus", "-b:a", "192k"],
+".avi": ["-c:a", "aac", "-b:a", "320k"],
+".ts": ["-c:a", "aac", "-b:a", "320k"],
+".m2ts": ["-c:a", "aac", "-b:a", "320k"],
+".mts": ["-c:a", "aac", "-b:a", "320k"],
+".mpg": ["-c:a", "aac", "-b:a", "320k"],
+".mpeg": ["-c:a", "aac", "-b:a", "320k"],
+".wmv": ["-c:a", "aac", "-b:a", "320k"],
+
 }
 
 SAFE_CODEC: dict[str, List[str]] = {
@@ -284,7 +468,24 @@ SAFE_CODEC: dict[str, List[str]] = {
     ".aac": ["-c:a", "aac", "-b:a", "256k"],
     ".flac": ["-c:a", "flac"],
     ".wav": ["-c:a", "pcm_s16le"],
-    ".wma": ["-c:a", "wmav2", "-b:a", "192k"]
+    ".wma": ["-c:a", "wmav2", "-b:a", "192k"],
+    ".ogg": ["-c:a", "libvorbis", "-q:a", "4"],
+    ".opus": ["-c:a", "libopus", "-b:a", "128k"],
+
+# Video containers (safer bitrate, video/subs copied)
+".mkv": ["-c:a", "flac"],
+".mp4": ["-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart"],
+".m4v": ["-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart"],
+".mov": ["-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart"],
+".webm": ["-c:a", "libopus", "-b:a", "128k"],
+".avi": ["-c:a", "aac", "-b:a", "256k"],
+".ts": ["-c:a", "aac", "-b:a", "256k"],
+".m2ts": ["-c:a", "aac", "-b:a", "256k"],
+".mts": ["-c:a", "aac", "-b:a", "256k"],
+".mpg": ["-c:a", "aac", "-b:a", "256k"],
+".mpeg": ["-c:a", "aac", "-b:a", "256k"],
+".wmv": ["-c:a", "aac", "-b:a", "256k"],
+
 }
 
 
@@ -298,80 +499,173 @@ def _codec_for_ext(ext: str, safe: bool = False) -> List[str]:
 
 
 def find_audio_files(folder: Path, recursive: bool) -> List[Path]:
+    """Return only files that actually contain at least one audio stream.
+
+    We *prefer* extensions for a quick pre-filter, but ultimately we verify with ffprobe.
+    This makes the app work with FLAC and essentially any format FFmpeg can decode.
+    """
     pattern = "**/*" if recursive else "*"
-    return [p for p in folder.glob(pattern) if p.suffix.lower() in SUPPORTED_EXTS and p.is_file()]
+    out: List[Path] = []
+    for p in folder.glob(pattern):
+        if not p.is_file():
+            continue
+
+        # Avoid re-processing output folders placed inside the source tree.
+        if any(str(part).endswith("_432Hz") for part in p.parts):
+            continue
+
+        # Skip partial torrent chunk files and other non-media temp files by name.
+        if p.name.startswith("~BitTorrentPartFile_"):
+            continue
+
+        # Skip temp files created during in-place replacement.
+        if ".__tmp432__" in p.name:
+            continue
+
+        # Skip already-converted outputs when "same folder" mode is used.
+        # (Output naming appends "_432" or "_432Hz" to the stem.)
+        stem_l = p.stem.lower()
+        if stem_l.endswith("_432") or stem_l.endswith("_432hz") or stem_l.endswith("_432_hz"):
+            continue
+
+        ext = p.suffix.lower()
+        if ext in IGNORE_EXTS:
+            continue
+
+        # If the extension is unknown, we still try probing (supports odd/rare formats).
+        # If the extension is known media, probing is expected.
+        if ext and ext not in KNOWN_MEDIA_EXTS:
+            # Still probe, but skip clearly non-media extensions above.
+            pass
+
+        has_audio, *_ = _probe_media_info(p)
+        if has_audio:
+            out.append(p)
+    return out
 
 
-def _get_audio_metadata(path: Path) -> Tuple[Optional[int], Optional[int]]:
+# Cache to avoid repeated ffprobe calls on the same file during a run.
+_MEDIA_INFO_CACHE: dict[Path, Tuple[bool, bool, bool, Optional[int], Optional[int]]] = {}
+
+
+def _probe_media_info(path: Path) -> Tuple[bool, bool, bool, Optional[int], Optional[int]]:
+    """Probe media streams.
+
+    Returns: (has_audio, has_real_video, has_attached_pic, sample_rate_hz, bit_rate_bps)
+
+    - "real video" excludes embedded cover art (attached_pic).
+    - sample_rate_hz is guaranteed when has_audio=True (falls back to 44100 if needed).
     """
-    Gets sample rate (Hz) and bitrate (bps) of the first audio stream.
-    Tries ffprobe, falls back to ffmpeg, and finally assumes 44100 Hz if both fail.
-    """
+    p = path.expanduser().resolve()
+    if p in _MEDIA_INFO_CACHE:
+        return _MEDIA_INFO_CACHE[p]
+
+    has_audio = False
+    has_real_video = False
+    has_attached_pic = False
     sample_rate: Optional[int] = None
     bit_rate: Optional[int] = None
 
-    # --- Method 1: ffprobe (strict, but fast and clean) ---
+    # --- Method 1: ffprobe JSON (best: can detect attached pics) ---
     cmd_probe = [
         _FFPROBE, "-v", "quiet", "-print_format", "json",
-        "-show_streams", "-select_streams", "a:0", str(path)
+        "-show_streams", str(p)
     ]
-    logging.debug(f"Executing ffprobe for metadata: {' '.join(cmd_probe)}")
     try:
         process = _popen_run(cmd_probe, capture_output=True, text=True, check=False, errors="ignore")
         if process.returncode == 0 and process.stdout:
             ffprobe_output = json.loads(process.stdout)
-            if ffprobe_output and "streams" in ffprobe_output and len(ffprobe_output["streams"]) > 0:
-                stream = ffprobe_output["streams"][0]
-                sr_str = stream.get("sample_rate")
-                if sr_str and sr_str.isdigit():
-                    sample_rate = int(sr_str)
-                br_str = stream.get("bit_rate")
-                if br_str and br_str.isdigit():
-                    bit_rate = int(br_str)
+            for stream in ffprobe_output.get("streams", []) or []:
+                ctype = stream.get("codec_type")
+                if ctype == "audio" and not has_audio:
+                    has_audio = True
+                    sr_str = stream.get("sample_rate")
+                    if sr_str and str(sr_str).isdigit():
+                        sample_rate = int(sr_str)
+                    br_str = stream.get("bit_rate")
+                    if br_str and str(br_str).isdigit():
+                        bit_rate = int(br_str)
+                elif ctype == "video":
+                    disp = stream.get("disposition") or {}
+                    try:
+                        attached = int(disp.get("attached_pic", 0)) == 1
+                    except Exception:
+                        attached = False
+                    if attached:
+                        has_attached_pic = True
+                    else:
+                        has_real_video = True
+            if has_audio and sample_rate is None:
+                sample_rate = 44100
 
-                if sample_rate:
-                    logging.info(f"Successfully got metadata for {path.name} via ffprobe.")
-                    return sample_rate, bit_rate
+            result = (has_audio, has_real_video, has_attached_pic, sample_rate, bit_rate)
+            _MEDIA_INFO_CACHE[p] = result
+            return result
     except Exception as e:
-        logging.warning(f"ffprobe failed for {path.name}: {e}", exc_info=False)
+        logging.warning(f"ffprobe probe failed for {p.name}: {e}", exc_info=False)
 
-    logging.warning(f"ffprobe failed for {path.name}. Falling back to ffmpeg.")
-
-    # --- Method 2: ffmpeg (more resilient, but requires parsing stderr) ---
-    cmd_ffmpeg = [_FFMPEG, "-i", str(path)]
-    logging.debug(f"Executing ffmpeg for metadata fallback: {' '.join(cmd_ffmpeg)}")
+    # --- Method 2: ffmpeg -i parse (fallback) ---
+    cmd_ffmpeg = [_FFMPEG, "-i", str(p)]
     try:
-        process = _popen_run(cmd_ffmpeg, capture_output=True, text=True, errors="ignore")
-        output = process.stderr
-        if output:
-            sr_match = re.search(r"(\d+)\s+Hz", output)
-            br_match = re.search(r"(\d+)\s+kb/s", output)
+        process = _popen_run(cmd_ffmpeg, capture_output=True, text=True, check=False, errors="ignore")
+        output = process.stderr or ""
+        if "Audio:" in output:
+            has_audio = True
+        if "Video:" in output:
+            has_real_video = True
+        if has_audio:
+            sr_match = re.search(r"(\d+)\s*Hz", output)
+            br_match = re.search(r"(\d+)\s*kb/s", output)
             if sr_match:
                 sample_rate = int(sr_match.group(1))
-                logging.info(f"Successfully got sample rate for {path.name} via ffmpeg fallback.")
             if br_match:
                 bit_rate = int(br_match.group(1)) * 1000
+            if sample_rate is None:
+                sample_rate = 44100
     except Exception as e:
-        logging.error(f"ffmpeg fallback for {path.name} failed with an unexpected error: {e}", exc_info=True)
+        logging.warning(f"ffmpeg probe failed for {p.name}: {e}", exc_info=False)
 
-    # --- Method 3: Assume 44100 Hz as a final fallback ---
-    if sample_rate is None:
-        logging.warning(f"All methods failed to get metadata for {path.name}. ASSUMING 44100 Hz.")
-        sample_rate = 44100
+    result = (has_audio, has_real_video, has_attached_pic, sample_rate, bit_rate)
+    _MEDIA_INFO_CACHE[p] = result
+    return result
 
-    return sample_rate, bit_rate
+
+def _get_audio_metadata(path: Path) -> Tuple[Optional[int], Optional[int]]:
+    # Backwards-compatible wrapper used by older code paths.
+    has_audio, _, _, sr, br = _probe_media_info(path)
+    if not has_audio:
+        return None, None
+    return sr, br
 
 
 # =============================================================================
 # 2.  Conversion function with automatic retry
 # =============================================================================
 
-def convert_to_432(src: Path, dst: Path, original_sr: int, target_sr: int, original_bitrate_bps: Optional[int]) -> None:
+def convert_to_432(
+        src: Path,
+        dst: Path,
+        original_sr: int,
+        target_sr: int,
+        original_bitrate_bps: Optional[int],
+        *,
+        has_real_video: bool = False,
+        has_attached_pic: bool = False,
+) -> None:
+    """Convert audio pitch from 440→432 Hz while preserving duration.
+
+    - For videos: copies video + subtitle streams (keeps original timing/sync) and re-encodes audio only.
+    - For audio: converts audio and preserves cover art where possible.
+    """
     logging.info(f"Converting {src} to {dst} with original SR {original_sr}, target SR {target_sr}")
     dst.parent.mkdir(parents=True, exist_ok=True)
 
-    # CORRECTED: The pitch shift calculation MUST use the original sample rate.
-    chain = f"asetrate={original_sr}*432/440,aresample={target_sr}"
+    # Duration‑preserving pitch shift (keeps video + subtitles perfectly synced):
+    #   1) Change sample rate (changes pitch + speed)
+    #   2) atempo compensates the speed back to original duration
+    #   3) resample to target sample rate
+    ratio = 432 / 440
+    chain = f"asetrate={original_sr}*{ratio},atempo={1/ratio},aresample={target_sr}"
 
     def _run(cmd_list: List[str]):
         logging.debug(f"Executing ffmpeg command: {' '.join(cmd_list)}")
@@ -386,34 +680,68 @@ def convert_to_432(src: Path, dst: Path, original_sr: int, target_sr: int, origi
             if b_a_idx + 1 < len(adjusted_options):
                 target_br_str = adjusted_options[b_a_idx + 1]
                 target_bps = -1
-                if target_br_str.lower().endswith('k'):
+                if target_br_str.lower().endswith("k"):
                     target_bps = int(target_br_str[:-1]) * 1000
                 elif target_br_str.isdigit():
                     target_bps = int(target_br_str)
                 if target_bps != -1 and orig_bps < target_bps:
                     adjusted_options[b_a_idx + 1] = f"{orig_bps // 1000}k"
                     logging.info(
-                        f"Adjusting target bitrate from {target_br_str} to original {adjusted_options[b_a_idx + 1]} for {src.name}")
+                        f"Adjusting target bitrate from {target_br_str} to original {adjusted_options[b_a_idx + 1]} for {src.name}"
+                    )
         except (ValueError, IndexError):
             pass
         return adjusted_options
 
-    base_cmd_list = [
-        _FFMPEG, "-y", "-i", str(src),
-        "-map", "0:a?", "-map", "0:v?", "-c:v", "copy",
-        "-af", chain,
-    ]
     ext = dst.suffix.lower()
+    is_video_container = ext in VIDEO_CONTAINER_EXTS
 
+    # Build base command (mapping/stream copy strategy)
+    if has_real_video and is_video_container:
+        # Preserve everything we can (subtitles, attachments, chapters, metadata), re-encode audio.
+        if ext == ".mkv":
+            map_args = ["-map", "0", "-map_metadata", "0", "-map_chapters", "0", "-copy_unknown"]
+            stream_copy_args = ["-c", "copy"]
+        else:
+            # Safer mapping for non-MKV containers (some don't support attachments)
+            map_args = [
+                "-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-map", "0:d?",
+                "-map_metadata", "0", "-map_chapters", "0",
+            ]
+            stream_copy_args = ["-c:v", "copy", "-c:s", "copy", "-c:d", "copy"]
+
+        base_cmd_list = [_FFMPEG, "-y", "-i", str(src)] + map_args + stream_copy_args + ["-filter:a", chain]
+    else:
+        # Audio-only outputs: map audio (and optional cover art where supported).
+        map_args: List[str] = ["-map", "0:a?"]
+        if (not has_real_video) and has_attached_pic and ext in {".mp3", ".m4a", ".flac"}:
+            map_args += ["-map", "0:v?", "-c:v", "copy"]
+        base_cmd_list = [_FFMPEG, "-y", "-i", str(src)] + map_args + ["-af", chain]
+
+    # Try HQ first
     hq_options = _adjust_bitrate_in_options(_codec_for_ext(ext, safe=False), original_bitrate_bps)
     hq_cmd_list = base_cmd_list + hq_options + [str(dst)]
     proc = _run(hq_cmd_list)
-
     if proc.returncode == 0:
         logging.info(f"Successfully converted {src.name} (HQ settings) to {dst.name}")
         return
 
     hq_stderr_cleaned = _clean_ffmpeg_err(proc.stderr) if proc.stderr is not None else "(no ffmpeg stderr captured)"
+
+    # Subtitle fallback for MP4/MOV when "copy" isn't supported for the subtitle codec
+    if has_real_video and is_video_container and ext in {".mp4", ".m4v", ".mov"}:
+        err_blob = proc.stderr or b""
+        err_lower = err_blob.lower() if isinstance(err_blob, (bytes, bytearray)) else str(err_blob).lower()
+        if ("subtitle" in err_lower) and (
+            "codec" in err_lower or "not supported" in err_lower or "could not write header" in err_lower
+        ):
+            logging.warning(f"Subtitle copy unsupported for {dst.name}. Retrying with mov_text subtitles.")
+            hq_cmd_list_sub = base_cmd_list + ["-c:s", "mov_text"] + hq_options + [str(dst)]
+            proc_sub = _run(hq_cmd_list_sub)
+            if proc_sub.returncode == 0:
+                logging.info(f"Successfully converted {src.name} (HQ + mov_text subs) to {dst.name}")
+                return
+
     logging.warning(f"HQ conversion failed for {src.name}. Retrying with safe settings. Error:\n{hq_stderr_cleaned}")
 
     safe_options = _adjust_bitrate_in_options(_codec_for_ext(ext, safe=True), original_bitrate_bps)
@@ -423,11 +751,9 @@ def convert_to_432(src: Path, dst: Path, original_sr: int, target_sr: int, origi
         logging.info(f"Successfully converted {src.name} (Safe preset) to {dst.name}")
         return
 
-    safe_stderr_cleaned = _clean_ffmpeg_err(
-        proc_safe.stderr) if proc_safe.stderr is not None else "(no ffmpeg stderr captured)"
+    safe_stderr_cleaned = _clean_ffmpeg_err(proc_safe.stderr) if proc_safe.stderr is not None else "(no ffmpeg stderr captured)"
     final_err_message = f"HQ error:\n{hq_stderr_cleaned}\nSafe error:\n{safe_stderr_cleaned}"
     raise subprocess.CalledProcessError(proc_safe.returncode, proc_safe.args, stderr=final_err_message)
-
 
 # =============================================================================
 # 3.  GUI and Drag‑and‑drop
@@ -482,7 +808,8 @@ if _tk is not None and _messagebox is not None and _filedialog is not None and _
             self.var_src = _tk.StringVar()
             self.entry_src = _ttk.Entry(f_src, textvariable=self.var_src, width=48)
             self.entry_src.pack(side="left", fill="x", expand=True, padx=(5, 0))
-            _ttk.Button(f_src, text="Browse…", command=self._browse_src).pack(side="left", padx=(5, 0))
+            _ttk.Button(f_src, text="Folder…", command=self._browse_src_folder).pack(side="left", padx=(5, 0))
+            _ttk.Button(f_src, text="File…", command=self._browse_src_file).pack(side="left", padx=(5, 0))
 
             if _TkDnD is not None and hasattr(self.entry_src, 'drop_target_register'):
                 self.entry_src.drop_target_register(_DND_FILES)
@@ -498,9 +825,13 @@ if _tk is not None and _messagebox is not None and _filedialog is not None and _
 
             f_opt = _ttk.Frame(self.root)
             f_opt.grid(row=2, column=0, sticky="w", **pad)
-            self.rec = _tk.BooleanVar(value=self.args.recursive)
+            self.rec = _tk.BooleanVar(value=True)  # default ON (batch folders usually contain subfolders)
             self.keep = _tk.BooleanVar(value=self.args.keep)
+            self.same_folder = _tk.BooleanVar(value=False)  # default OFF (A: output to *_432Hz)
+            self.replace_original = _tk.BooleanVar(value=getattr(self.args, 'replace_original', False))  # replace originals (creates .bak)
             _ttk.Checkbutton(f_opt, text="Recursive", variable=self.rec).pack(side="left")
+            _ttk.Checkbutton(f_opt, text="Output in same folder", variable=self.same_folder, command=self._auto_set_output).pack(side="left", padx=(10, 0))
+            _ttk.Checkbutton(f_opt, text="Replace originals (.bak)", variable=self.replace_original, command=self._auto_set_output).pack(side="left", padx=(10, 0))
             _ttk.Checkbutton(f_opt, text="Skip existing", variable=self.keep).pack(side="left", padx=(10, 0))
 
             self.bar = _ttk.Progressbar(self.root, length=420, mode="determinate")
@@ -511,19 +842,29 @@ if _tk is not None and _messagebox is not None and _filedialog is not None and _
         def _apply_initial_args(self):
             if self.args.folder:
                 p = Path(self.args.folder).resolve()
-                if p.is_dir():
+                if p.exists():
                     self._set_src(p)
                 else:
                     _messagebox.showwarning("Warning",
-                                            f"The provided source folder is not a valid directory:\n{self.args.folder}")
+                                            f"The provided source path does not exist:\n{self.args.folder}")
             if self.args.outdir:
+                # If user explicitly supplied output, respect it.
                 self._set_out(Path(self.args.outdir).resolve())
-            elif self.src and not self.var_out.get():
-                self._set_out(self.src.parent / f"{self.src.name}_432Hz")
 
-        def _browse_src(self):
+        def _browse_src_folder(self):
             d = _filedialog.askdirectory(title="Select Source Folder")
-            if d: self._set_src(Path(d))
+            if d:
+                self._set_src(Path(d))
+
+        def _browse_src_file(self):
+            f = _filedialog.askopenfilename(
+                title="Select Media File",
+                filetypes=[
+                    ("Media files", "*.*"),
+                ],
+            )
+            if f:
+                self._set_src(Path(f))
 
         def _browse_out(self):
             d = _filedialog.askdirectory(title="Select Output Base Folder")
@@ -531,37 +872,64 @@ if _tk is not None and _messagebox is not None and _filedialog is not None and _
 
         def _ondrop_src(self, event):
             p = _parse_drop_data(event.data)
-            if p and p.is_dir():
+            if p:
                 self._set_src(p)
-            else:
-                _messagebox.showwarning("Invalid Drop", "Please drop a folder, not a file.")
 
         def _set_src(self, p: Path):
             self.src = p.resolve()
             self.var_src.set(str(self.src))
-            if not self.var_out.get() and self.src.is_dir():
-                self._set_out(self.src.parent / f"{self.src.name}_432Hz")
+            # Always auto-update output when source changes (as requested)
+            self._auto_set_output()
 
         def _set_out(self, p: Path):
             self.dst_base = p.resolve()
             self.var_out.set(str(self.dst_base))
 
+        def _auto_set_output(self):
+            """Auto-set output folder based on current source and the 'Output in same folder' checkbox."""
+            if not self.src:
+                return
+            try:
+                # If replacing originals, output base is informational only.
+                if getattr(self, 'replace_original', None) is not None and self.replace_original.get():
+                    out_dir = self.src if self.src.is_dir() else self.src.parent
+                    self._set_out(Path(out_dir))
+                    return
+                if self.same_folder.get():
+                    # Output next to sources; originals remain untouched because we suffix filenames.
+                    out_dir = self.src if self.src.is_dir() else self.src.parent
+                else:
+                    if self.src.is_dir():
+                        out_dir = self.src.parent / f"{self.src.name}_432Hz"
+                    else:
+                        parent = self.src.parent
+                        out_dir = parent.parent / f"{parent.name}_432Hz"
+                self._set_out(Path(out_dir))
+            except Exception as e:
+                logging.warning(f"Failed to auto-set output folder: {e}")
+
         def _start(self):
             if self.thread and self.thread.is_alive():
                 _messagebox.showwarning("Busy", "Conversion is already in progress.")
                 return
-            if not self.src or not self.src.is_dir():
-                _messagebox.showerror("Error", "Please select a valid source folder.")
+            if not self.src or not self.src.exists():
+                _messagebox.showerror("Error", "Please select a valid source folder or a single media file.")
                 return
-            self.dst_base = Path(self.var_out.get()).resolve()
-            if not self.dst_base:
-                _messagebox.showerror("Error", "Please select an output folder.")
-                return
-            try:
-                self.dst_base.mkdir(parents=True, exist_ok=True)
-            except OSError as e:
-                _messagebox.showerror("Error", f"Cannot create output folder:\n{self.dst_base}\n{e}")
-                return
+
+            # If replacing originals, output base is informational only; conversions happen via temp files next to each source.
+            if self.replace_original.get():
+                self.dst_base = (self.src if self.src.is_dir() else self.src.parent).resolve()
+                self.var_out.set(str(self.dst_base))
+            else:
+                self.dst_base = Path(self.var_out.get()).resolve()
+                if not self.dst_base:
+                    _messagebox.showerror("Error", "Please select an output folder.")
+                    return
+                try:
+                    self.dst_base.mkdir(parents=True, exist_ok=True)
+                except OSError as e:
+                    _messagebox.showerror("Error", f"Cannot create output folder:\n{self.dst_base}\n{e}")
+                    return
 
             self.btn.config(state="disabled")
             self.bar["value"] = 0
@@ -580,19 +948,45 @@ if _tk is not None and _messagebox is not None and _filedialog is not None and _
 
         def _worker(self):
             assert self.src and self.dst_base, "Source or destination not set"
-            files = find_audio_files(self.src, self.rec.get())
+            files = [self.src] if (self.src and self.src.is_file()) else find_audio_files(self.src, self.rec.get())
             total = len(files)
             if not total:
-                self.root.after(0, lambda: _messagebox.showinfo("Info", "No supported audio files found."))
+                self.root.after(0, lambda: _messagebox.showinfo("Info", "No media files with audio were found in the selected folder."))
                 return
 
             self.bar.config(maximum=total)
             errors_occurred = False
             for idx, f_path in enumerate(files, 1):
                 self.root.after(0, lambda i=idx: self.bar.config(value=i))
-                ext_out = ".mp3" if f_path.suffix.lower() == ".wma" else f_path.suffix
-                rel_path = f_path.relative_to(self.src)
-                dst_file = self.dst_base / rel_path.with_name(f"{f_path.stem}_432{ext_out}")
+
+                has_audio, has_real_video, has_attached_pic, original_sample_rate, original_bitrate = _probe_media_info(f_path)
+                if not has_audio:
+                    # Shouldn't happen because find_audio_files filters, but be defensive.
+                    logging.info(f"Skipping non-audio file after probe: {f_path}")
+                    continue
+
+                ext_out = _choose_output_ext(f_path.suffix, has_real_video)
+
+                # Compute destination path:
+                # - Replace originals: write a temp file next to each source, then swap in-place (original kept as .bak)
+                # - Folder mode: preserve relative subfolder structure under dst_base
+                # - Single-file mode: place into dst_base (or next to source when same_folder=True)
+                if self.replace_original.get():
+                    # Keep the same container/extension when replacing originals.
+                    ext_out = f_path.suffix
+                    dst_file = f_path.with_name(f"{f_path.stem}.__tmp432__{ext_out}")
+                elif self.src and self.src.is_dir():
+                    rel_path = f_path.relative_to(self.src)
+                    if self.same_folder.get():
+                        dst_file = f_path.parent / f"{f_path.stem}_432{ext_out}"
+                    else:
+                        dst_file = self.dst_base / rel_path.with_name(f"{f_path.stem}_432{ext_out}")
+                else:
+                    rel_path = Path(f_path.name)
+                    if self.same_folder.get():
+                        dst_file = f_path.parent / f"{f_path.stem}_432{ext_out}"
+                    else:
+                        dst_file = self.dst_base / rel_path.with_name(f"{f_path.stem}_432{ext_out}")
 
                 try:
                     dst_file.parent.mkdir(parents=True, exist_ok=True)
@@ -607,22 +1001,47 @@ if _tk is not None and _messagebox is not None and _filedialog is not None and _
                     logging.info(f"GUI Worker: Skipping existing file: {dst_file}")
                     continue
 
-                original_sample_rate, original_bitrate = _get_audio_metadata(f_path)
-
-                # The check for None is now effectively gone, as _get_audio_metadata will always return a value
-                # (or the assumed default). This prevents the "Skipped" message for metadata reasons.
-
                 target_sample_rate = 48000
                 try:
                     # CORRECTED: Pass the original sample rate to the conversion function.
-                    convert_to_432(f_path, dst_file, original_sample_rate, target_sample_rate, original_bitrate)
+                    convert_to_432(
+                        f_path,
+                        dst_file,
+                        int(original_sample_rate) if original_sample_rate else 44100,
+                        target_sample_rate,
+                        original_bitrate,
+                        has_real_video=has_real_video,
+                        has_attached_pic=has_attached_pic,
+                    )
+                    if self.replace_original.get():
+                        try:
+                            _replace_original_with_backup(f_path, dst_file)
+                            logging.info(f"Replaced original with 432Hz version (backup created): {f_path.name}")
+                        finally:
+                            # If something went wrong and temp still exists, clean it up.
+                            if dst_file.exists() and dst_file.name.find('.__tmp432__') != -1:
+                                try:
+                                    dst_file.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+
                 except subprocess.CalledProcessError as e_conv:
+                    if self.replace_original.get() and '.__tmp432__' in dst_file.name:
+                        try:
+                            dst_file.unlink(missing_ok=True)
+                        except Exception:
+                            pass
                     logging.error(f"GUI Worker: Conversion failed for {f_path.name}: {e_conv.stderr}", exc_info=False)
                     self.root.after(0,
                                     lambda p=f_path.name, err=e_conv.stderr: _messagebox.showerror("Conversion Error",
                                                                                                    f"Failed to convert:\n{p}\n\nError:\n{err}"))
                     errors_occurred = True
                 except Exception as e_gen:
+                    if self.replace_original.get() and '.__tmp432__' in dst_file.name:
+                        try:
+                            dst_file.unlink(missing_ok=True)
+                        except Exception:
+                            pass
                     logging.error(f"GUI Worker: Unexpected error converting {f_path.name}: {e_gen}", exc_info=True)
                     self.root.after(0, lambda p=f_path.name, err=e_gen: _messagebox.showerror("Conversion Error",
                                                                                               f"Unexpected error converting:\n{p}\n\nError:\n{err}"))
@@ -640,9 +1059,11 @@ if _tk is not None and _messagebox is not None and _filedialog is not None and _
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="440→432 Hz batch converter (GUI)")
     p.add_argument("folder", type=Path, nargs="?", default=None,
-                   help="Optional: Source music folder to pre-fill in GUI.")
+                   help="Optional: Source folder OR a single media file to pre-fill in GUI.")
     p.add_argument("-r", "--recursive", action="store_true", help="Pre-select recursive search in GUI.")
     p.add_argument("--keep", action="store_true", help="Pre-select skipping existing files in GUI.")
+    p.add_argument("--replace", dest="replace_original", action="store_true",
+                   help="Pre-select replacing originals (creates .bak backups) in GUI.")
     p.add_argument("--ffmpeg", dest="ffmpeg_path", type=Path,
                    help="Path to ffmpeg folder/executable for FFmpeg/FFprobe resolution.")
     p.add_argument("--out", dest="outdir", type=Path, help="Optional: Destination base folder to pre-fill in GUI.")
