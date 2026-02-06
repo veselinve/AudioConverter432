@@ -1,9 +1,0 @@
-# Ignore vendored/non-source code (like HTML, Actions, etc.)
-.github/** linguist-vendored
-docs/** linguist-vendored
-*.html linguist-vendored
-*.css linguist-vendored
-*.js linguist-vendored
-
-# Ensure Python files are counted
-*.py linguist-detectable
