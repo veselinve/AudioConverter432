@@ -91,20 +91,6 @@ ffmpeg/                  put static FFmpeg build here (ffmpeg.exe, ffprobe.exe)
 assets/                  icons, screenshots
 requirements.txt         runtime deps for developers
 ```
-
----
-
-## 🚧 Roadmap
-
-- [ ] macOS notarised `.app` bundle
-
----
-
-## 🤝 Contributing
-
-Pull requests are welcome! Please open an issue first to discuss any major change.
-Run `python batch_432_converter.py --test` before committing—unit tests must pass.
-
 ---
 
 ## 📄 License
