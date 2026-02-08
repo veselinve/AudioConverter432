@@ -33,65 +33,18 @@ Planetary resonance
 |---|---|
 | **Drag-and-drop GUI** | Pick source & output folders, progress bar, optional recursion. |
 | **Smart FFmpeg resolver** | Finds `ffmpeg.exe`/`ffprobe.exe` next to the app, inside *ffmpeg-* sub-folders, or on **PATH**; override with `--ffmpeg`. |
-| **HQ → Safe fallback** | First tries highest-quality codec flags, then retries with safe presets if the build lacks a feature. |
 | **Keeps original bit-rate** | Reads bitrate with `ffprobe`; avoids unwanted up/down-sizing. |
-| **No flashing consoles** | All FFmpeg calls run with *CREATE_NO_WINDOW* on Windows. |
 | **Portable EXE** | `pyinstaller --onefile`, bundles FFmpeg; double-click to run on PCs without Python. |
 | **Verbose logging** | `app_converter.log` written beside the EXE; warnings surface in GUI. |
 
 ---
 
-## 📦 Quick start (source)
-
-```bash
-# clone & enter
-$ git clone https://github.com/YOUR-NAME/432hz-converter.git
-$ cd 432hz-converter
-
-# create isolated env (optional but recommended)
-$ python -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
-
-# install runtime deps
-$ pip install -r requirements.txt  # tkinterdnd2, tqdm
-
-# run the GUI
-$ python batch_432_converter.py
-```
----
-
-## 🛠 Build a portable EXE (Windows)
-
-```bash
-pip install pyinstaller
-
-pyinstaller --onefile --noconsole \
-           --add-binary "ffmpeg/ffmpeg.exe;." \
-           --add-binary "ffmpeg/ffprobe.exe;." \
-           --hidden-import tkinterdnd2 \
-           --icon assets/icon.ico \
-           batch_432_converter.py
-```
-
-Result appears in `dist/batch_432_converter.exe`.
-
----
 
 ## 🖥 Screenshot
 
 <img width="677" height="205" alt="converter" src="https://github.com/user-attachments/assets/fcf41390-c320-47ca-abdb-b27aa659c335" />
 
 
-
----
-
-## 📚 Code layout
-
-```text
-batch_432_converter.py   main script (GUI)
-ffmpeg/                  put static FFmpeg build here (ffmpeg.exe, ffprobe.exe)
-assets/                  icons, screenshots
-requirements.txt         runtime deps for developers
-```
 ---
 
 ## 📄 License
