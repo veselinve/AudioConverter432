@@ -20,6 +20,7 @@ Optional:
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 import shutil
 import stat
@@ -64,18 +65,25 @@ def _on_rm_error(func, path, exc_info):
         raise
 
 
+def _rmtree_kwargs() -> dict:
+    # Python 3.12 deprecated onerror (removed in 3.14) in favour of onexc.
+    if "onexc" in inspect.signature(shutil.rmtree).parameters:
+        return {"onexc": _on_rm_error}
+    return {"onerror": _on_rm_error}
+
+
 def _safe_rmtree(p: Path) -> None:
     if not p.exists():
         return
     try:
-        shutil.rmtree(p, onerror=_on_rm_error)
+        shutil.rmtree(p, **_rmtree_kwargs())
     except Exception as e:
         # If something is locking it (e.g. antivirus / explorer), don't hard-fail.
         # Move it aside so the build can continue.
         backup = p.with_name(p.name + "_old")
         try:
             if backup.exists():
-                shutil.rmtree(backup, onerror=_on_rm_error)
+                shutil.rmtree(backup, **_rmtree_kwargs())
             p.rename(backup)
             _print(f"WARNING: Could not delete '{p}'. Renamed to '{backup}'. ({e})")
         except Exception:
@@ -233,12 +241,14 @@ def _bundle_ffmpeg_args(ffmpeg_bin: Path) -> list[str]:
     args: list[str] = []
     dest = "vendors/ffmpeg/bin"
 
-    # Only bundle what FFmpeg needs at runtime: .exe + .dll
+    # Only bundle what FFmpeg needs at runtime: ffmpeg/ffprobe executables + DLLs.
+    # ffplay.exe (~100 MB) is a player the app never uses and only slows every
+    # onefile startup unpack, so it is deliberately excluded.
+    wanted = {"ffmpeg", "ffprobe"}
     for f in ffmpeg_bin.iterdir():
         if not f.is_file():
             continue
-        ext = f.suffix.lower()
-        if ext in (".exe", ".dll"):
+        if f.stem.lower() in wanted or f.suffix.lower() == ".dll":
             spec = f"{str(f)}{os.pathsep}{dest}"
             args.append(f"--add-binary={spec}")
 
@@ -267,6 +277,33 @@ def _zip_release(dist_dir: Path, exe_name: str) -> Path:
     return zip_path
 
 
+def _make_portable_zip(dist_dir: Path, exe_path: Path, ffmpeg_bin: Path) -> Path:
+    """Create the distributable package: one folder with the EXE plus an
+    ffmpeg/ subfolder (ffmpeg.exe + ffprobe.exe next to each other).
+
+    The app resolves FFmpeg from the ffmpeg/ folder beside the EXE, so the
+    unzipped folder is fully portable and starts fast — no per-run unpacking,
+    nothing in AppData.
+    """
+    zip_path = dist_dir / f"{EXE_NAME}_portable.zip"
+    if zip_path.exists():
+        zip_path.unlink()
+    wanted = {"ffmpeg", "ffprobe"}
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.write(exe_path, arcname=f"{EXE_NAME}/{exe_path.name}")
+        for f in sorted(ffmpeg_bin.iterdir()):
+            if f.is_file() and f.stem.lower() in wanted:
+                z.write(f, arcname=f"{EXE_NAME}/ffmpeg/{f.name}")
+    return zip_path
+
+
+def _copy_ffmpeg_beside(exe_path: Path, ffmpeg_bin: Path) -> None:
+    wanted = {"ffmpeg", "ffprobe"}
+    for f in sorted(ffmpeg_bin.iterdir()):
+        if f.is_file() and f.stem.lower() in wanted:
+            shutil.copy2(f, exe_path.parent / f.name)
+
+
 def create_executable(
     *,
     onefile: bool = True,
@@ -274,6 +311,7 @@ def create_executable(
     download_ffmpeg: bool = True,
     make_zip: bool = False,
     skip_pip: bool = False,
+    embed_ffmpeg: bool = False,
 ) -> None:
     _print("=== 432Hz Converter EXE Build ===")
     project_dir = Path(__file__).resolve().parent
@@ -334,8 +372,10 @@ def create_executable(
     else:
         args.append("--onedir")
 
-    # Bundle FFmpeg if available
-    if ffmpeg_bin:
+    # Embed FFmpeg only when explicitly requested: a plain --add-binary bundle
+    # unpacks ~200 MB on EVERY start and makes the app slow to appear. The
+    # default stores FFmpeg as a compressed resource with a one-time cache.
+    if ffmpeg_bin and embed_ffmpeg:
         args += _bundle_ffmpeg_args(ffmpeg_bin)
 
     # Finally: the entry script
@@ -368,6 +408,16 @@ def create_executable(
         else:
             raise RuntimeError("Build finished but executable was not found in dist/. Check PyInstaller output above.")
 
+    if ffmpeg_bin and not embed_ffmpeg:
+        if onefile:
+            # Distributable package: EXE + ffmpeg/ folder, zipped for upload.
+            zip_path = _make_portable_zip(dist_dir, exe_path, ffmpeg_bin)
+            _print(f"✅ Portable zip created: {zip_path.resolve()} "
+                   f"(unzip -> one folder, fast start, nothing in AppData)")
+        else:
+            _copy_ffmpeg_beside(exe_path, ffmpeg_bin)
+            _print(f"✅ Fast layout: ffmpeg.exe/ffprobe.exe copied next to {exe_path.resolve()}")
+
     if make_zip:
         zip_path = _zip_release(dist_dir, EXE_NAME)
         _print(f"📦 Release zip created: {zip_path.resolve()}")
@@ -382,6 +432,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--no-download-ffmpeg", action="store_true", help="Do not auto-download FFmpeg if missing.")
     p.add_argument("--zip", action="store_true", help="Create dist/<name>_release.zip after build.")
     p.add_argument("--skip-pip", action="store_true", help="Skip pip installs (assume deps already installed).")
+    p.add_argument("--embed-ffmpeg", action="store_true",
+                   help="Bundle FFmpeg directly in the archive (unpacks on every start; slower). "
+                        "Default: single EXE with FFmpeg stored as a compressed resource and a one-time cache.")
     return p.parse_args()
 
 
@@ -393,4 +446,5 @@ if __name__ == "__main__":
         download_ffmpeg=(not ns.no_download_ffmpeg),
         make_zip=bool(ns.zip),
         skip_pip=bool(ns.skip_pip),
+        embed_ffmpeg=bool(ns.embed_ffmpeg),
     )
